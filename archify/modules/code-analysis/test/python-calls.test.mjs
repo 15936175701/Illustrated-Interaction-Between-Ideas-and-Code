@@ -8,16 +8,16 @@ import { test } from 'node:test';
 import { createHash } from 'node:crypto';
 const base = process.env.ARCHIFY_CALL_TEST_MODULE;
 const load = relative => import(base ? pathToFileURL(path.join(base, relative)) : new URL(`../${relative}`, import.meta.url));
-const { extractFacts } = await load('lib/analysis.mjs');
+const { extractFacts, loadConfig, mergeConfig } = await load('lib/analysis.mjs');
 const { buildQuestion } = await load('lib/explain.mjs');
 const { schemaErrors } = await load('extract/shared/schema.mjs');
-function fixture(t, files) {
+function fixture(t, files, config = null) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'archify-python-calls-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   for (const [file, text] of Object.entries(files)) {
     fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true }); fs.writeFileSync(path.join(root, file), text);
   }
-  return { root, facts: extractFacts(root, { language: 'py' }).facts, entry: 'entry.py', question: 'Where is the source definition?' };
+  return { root, facts: extractFacts(root, { language: 'py', config }).facts, entry: 'entry.py', question: 'Where is the source definition?' };
 }
 const selected = args => buildQuestion({ ...args, symbol: 'chosen' }).calls;
 
@@ -32,13 +32,247 @@ test('Python BOM decoding keeps fresh entry and imported target coordinates alig
 
 test('Python call inventory, direct alias targets, async definition and known zero', t => {
   const args = fixture(t, { 'entry.py': 'from helper import work as alias\ndef local(): pass\nasync def task(): pass\ndef chosen():\n    local()\n    alias()\n    task()\n    obj.method()\n    factory()()\n', 'helper.py': 'def work(): pass\n' });
-  assert.equal(args.facts.callModel, 'python-lexical-v2'); assert.equal(args.facts.repository.adapterRevision, 10);
+  assert.equal(args.facts.callModel, 'python-lexical-v2'); assert.equal(args.facts.repository.adapterRevision, 13);
   assert.deepEqual(schemaErrors('raw-facts', args.facts), []);
   const calls = selected(args); assert.equal(calls.coverage, 'available'); assert.equal(calls.total, 6);
   assert.deepEqual(calls.records.map(r => r.fact.resolution), ['same-file-function', 'imported-function', 'same-file-function', ...Array(3).fill('unresolved')]);
   assert.deepEqual(calls.records[1].targetNavigation.location, { file: 'helper.py', name: 'work', line: 1, column: 1 });
   assert.ok(calls.records.every(r => JSON.stringify(r.fact) === JSON.stringify(args.facts.calls[r.factIndex])));
   const zero = buildQuestion({ ...args, symbol: 'local' }).calls; assert.equal(zero.coverage, 'available'); assert.equal(zero.total, 0);
+});
+
+test('Python measures an if inside else deeper than elif', t => {
+  const { facts } = fixture(t, { 'entry.py': `def nested(a, b):
+    if a: return 1
+    else:
+        if b: return 2
+def sibling(a, b):
+    if a: return 1
+    elif b: return 2
+` });
+  assert.deepEqual(facts.functions.map(f => [f.name, f.nesting]), [['nested', 2], ['sibling', 1]]);
+});
+
+test('Python Jedi fills captured declaration targets while retaining lexical and parse coverage', {
+  skip: process.env.ARCHIFY_TEST_PYTHON_JEDI !== '1' && 'set ARCHIFY_TEST_PYTHON_JEDI=1 with Jedi in BAUIFY_PYTHON',
+}, t => {
+  const config = mergeConfig(loadConfig(), { python: { jedi: true }, exclude: ['**/hidden.py'] });
+  const args = fixture(t, {
+    'entry.py': `from forwarded import helper
+from models import Worker
+from hidden import Hidden
+def local(): pass
+def chosen(worker: Worker, hidden: Hidden):
+    local()
+    helper()
+    "😀"; worker.run()
+    hidden.run()
+    Worker()
+`,
+    'forwarded.py': 'from base import helper\n',
+    'base.py': 'def helper(): pass\n',
+    'models.py': 'class Worker:\n    async def run(self): pass\n',
+    'hidden.py': 'from models import Worker as Hidden\n',
+    'fallback.py': `from models import Worker
+def local(): pass
+def chosen(worker: Worker, value):
+    match value:
+        case 0: local()
+    worker.run()
+def unaffected(worker: Worker):
+    worker.run()
+`,
+    'module-match.py': `from models import Worker
+match 0:
+    case 0: pass
+def unaffected(worker: Worker):
+    worker.run()
+`,
+    'pattern-shadow.py': `from models import Worker
+def chosen(worker: Worker, value):
+    match value:
+        case worker:
+            worker.run()
+`,
+  }, config);
+  assert.equal(args.facts.callModel, 'python-lexical-v3');
+  assert.match(args.facts.repository.adapter, /\+jedi@[^+]+\+parso@/);
+  assert.equal(args.facts.parse_errors, undefined);
+  assert.deepEqual(schemaErrors('raw-facts', args.facts), []);
+  const calls = selected(args);
+  assert.equal(calls.coverage, 'available');
+  assert.deepEqual(calls.records.map(r => r.fact.resolution), [
+    'same-file-function', 'imported-function', 'python-jedi-declaration', 'unresolved', 'unresolved',
+  ]);
+  assert.deepEqual(calls.records[2].targetNavigation.location, { file: 'models.py', name: 'run', line: 2, column: 5 });
+  assert.deepEqual(args.facts.calls.filter(c => c.file === 'fallback.py').map(c => c.resolution), [
+    'same-file-function', 'python-jedi-declaration', 'python-jedi-declaration',
+  ]);
+  assert.equal(args.facts.calls.find(c => c.file === 'module-match.py').target.file, 'models.py');
+  assert.equal(args.facts.calls.find(c => c.file === 'pattern-shadow.py').resolution, 'unresolved');
+  assert.ok(schemaErrors('raw-facts', { ...args.facts, callModel: 'python-lexical-v2' })
+    .some(e => e.message.includes('Python Jedi source model')));
+  fs.writeFileSync(path.join(args.root, 'models.py'), 'class Worker:\n    async def run(self): return 1\n');
+  assert.equal(selected(args).records[2].targetNavigation.status, 'changed');
+});
+
+test('Python Jedi recovers enum class method declarations without treating enum members as functions', {
+  skip: process.env.ARCHIFY_TEST_PYTHON_JEDI !== '1' && 'set ARCHIFY_TEST_PYTHON_JEDI=1 with Jedi in BAUIFY_PYTHON',
+}, t => {
+  const config = mergeConfig(loadConfig(), { python: { jedi: true } });
+  const { facts } = fixture(t, {
+    'entry.py': `import status
+def chosen():
+    status.Status.accepts(200)
+    status.Status.OK()
+`,
+    'status.py': `from enum import IntEnum
+class Status(IntEnum):
+    OK = 200
+    @classmethod
+    def accepts(cls, code: int) -> bool: return code == 200
+`,
+  }, config);
+  const calls = facts.calls.filter(c => c.file === 'entry.py');
+  assert.deepEqual(calls.map(c => c.target), [
+    { file: 'status.py', name: 'accepts', line: 5, column: 5 },
+    undefined,
+  ]);
+});
+
+test('Python Jedi follows unique cross-module callable exports', {
+  skip: process.env.ARCHIFY_TEST_PYTHON_JEDI !== '1' && 'set ARCHIFY_TEST_PYTHON_JEDI=1 with Jedi in BAUIFY_PYTHON',
+}, t => {
+  // Pyright findDefinitions.functions covers both an alias and a factory export.
+  const config = mergeConfig(loadConfig(), { python: { jedi: true } });
+  const { facts } = fixture(t, {
+    'entry.py': `import api
+def chosen(holder: api.Holder):
+    api.direct()
+    api.created()
+    api.ambiguous()
+    holder.direct()
+`,
+    'api.py': `import impl
+import other
+direct = impl.direct
+created = impl.make()
+def choose(flag: bool):
+    return impl.ambiguous if flag else other.ambiguous
+ambiguous = choose(unknown)
+class Holder:
+    def __init__(self):
+        self.direct = impl.direct
+`,
+    'impl.py': `def direct(): pass
+def make():
+    def created(): pass
+    return created
+def ambiguous(): pass
+`,
+    'other.py': 'def ambiguous(): pass\n',
+  }, config);
+  assert.deepEqual(facts.calls.filter(c => c.file === 'entry.py').map(c => c.target), [
+    { file: 'impl.py', name: 'direct', line: 1, column: 1 },
+    { file: 'impl.py', name: 'created', line: 3, column: 5 },
+    undefined,
+    undefined,
+  ]);
+});
+
+test('Python snapshots type inputs and retains project source targets', {
+  skip: process.env.ARCHIFY_TEST_PYTHON_JEDI !== '1' && 'set ARCHIFY_TEST_PYTHON_JEDI=1 with Jedi in BAUIFY_PYTHON',
+}, t => {
+  const config = mergeConfig(loadConfig(), {
+    python: { jedi: true, extraPaths: ['components'], declarations: { dependency: 'inputs/dependency.pyi' } },
+    exclude: ['**/inputs/**'],
+  });
+  const { root, facts } = fixture(t, {
+    'entry.py': `import factory
+import dependency
+from extras import Extra
+def chosen(extra: Extra):
+    factory.build("Worker").run()
+    dependency.build().run()
+    extra.run()
+`,
+    'model.py': 'class Worker:\n    def run(self): pass\n',
+    'factory.py': 'import importlib\ndef build(name): return getattr(importlib.import_module("model"), name)()\n',
+    'factory.pyi': 'from model import Worker\ndef build(name: str) -> Worker: ...\n',
+    'inputs/dependency.pyi': 'from model import Worker\ndef build() -> Worker: ...\n',
+    'components/extras.py': 'class Extra:\n    def run(self): pass\n',
+  }, config);
+  const targets = facts.calls.filter(c => c.file === 'entry.py' && c.target?.name === 'run').map(c => c.target);
+  assert.deepEqual(targets, [
+    { file: 'model.py', name: 'run', line: 2, column: 5 },
+    { file: 'model.py', name: 'run', line: 2, column: 5 },
+    { file: 'components/extras.py', name: 'run', line: 2, column: 5 },
+  ]);
+  assert.deepEqual(facts.languageScope.stubs.map(s => s.file), ['factory.pyi']);
+  assert.deepEqual(facts.languageScope.declarations.map(s => s.file), ['dependency.pyi']);
+  assert.ok(facts.files.every(f => f.path.endsWith('.py')));
+  fs.appendFileSync(path.join(root, 'inputs', 'dependency.pyi'), '# Updated declaration input\n');
+  const after = extractFacts(root, { language: 'py', config }).facts;
+  assert.notEqual(after.repository.snapshotId, facts.repository.snapshotId);
+  assert.deepEqual(after.calls, facts.calls);
+});
+
+test('Python target profile selects platform declarations and checks grammar version', {
+  skip: process.env.ARCHIFY_TEST_PYTHON_JEDI !== '1' && 'set ARCHIFY_TEST_PYTHON_JEDI=1 with Jedi in BAUIFY_PYTHON',
+}, t => {
+  const config = mergeConfig(loadConfig(), { python: { jedi: true, targetPlatform: 'Windows', targetVersion: '3.8' } });
+  const { root, facts } = fixture(t, {
+    'entry.py': `import sys
+if sys.platform == "win32":
+    def platform_work(): return "windows"
+else:
+    def platform_work(): return "posix"
+def chosen(): return platform_work()
+if unknown:
+    def optional_work(): return 1
+else:
+    optional_work = None
+def optional(): return optional_work()
+`,
+    'version.py': 'def newer(value):\n    match value:\n        case 0: return 0\n',
+  }, config);
+  assert.equal(facts.calls.find(c => c.file === 'entry.py').target.line, 3);
+  assert.equal(facts.calls.find(c => c.file === 'entry.py' && c.line === 11).target.name, 'optional_work');
+  assert.equal(facts.parse_errors[0].path, 'version.py');
+  assert.match(facts.files.find(f => f.path === 'entry.py').sourceText, /sys\.platform/);
+  const linux = extractFacts(root, { language: 'py', config: mergeConfig(config, { python: { targetPlatform: 'Linux' } }) }).facts;
+  assert.equal(linux.calls.find(c => c.file === 'entry.py').target.line, 5);
+});
+
+test('Python resolves receiver evidence while preserving ambiguity and shadowed guards', {
+  skip: process.env.ARCHIFY_TEST_PYTHON_JEDI !== '1' && 'set ARCHIFY_TEST_PYTHON_JEDI=1 with Jedi in BAUIFY_PYTHON',
+}, t => {
+  const config = mergeConfig(loadConfig(), { python: { jedi: true } });
+  const { facts } = fixture(t, { 'entry.py': `from typing import Callable, Generator
+class Base:
+    def run(self): pass
+class Task(Base):
+    def run(self): pass
+class Recorder:
+    def record(self, callback: Callable[[Task], None]): pass
+    def add(self): self.record(lambda task: task.run())
+def from_yield() -> Generator[int, Task, None]:
+    task = yield 1
+    task.run()
+def narrowed(items: list[Base]):
+    selected = [item for item in items if isinstance(item, Task)]
+    return [item.run() for item in selected]
+def shadowed(value: Base, *, isinstance):
+    if isinstance(value, Task):
+        value.run()
+def rebound(value: Base):
+    if isinstance(value, Task):
+        value = Base(); value.run()
+def ambiguous(value: Base | Task):
+    value.run()
+` }, config);
+  const methods = facts.calls.filter(c => c.target?.name === 'run');
+  assert.deepEqual(methods.map(c => [c.line, c.target.line]), [[8, 5], [11, 5], [14, 5], [17, 3], [20, 3]]);
 });
 
 test('Python unsupported/rebound/conditional/decorated/long-reexport/class targets stay inventoried', t => {

@@ -9,10 +9,11 @@ import { fileURLToPath } from 'node:url';
 import { fail } from '../shared/diagnostics.mjs';
 import { classifyRole, listFiles, snapshotSources } from '../shared/files.mjs';
 import { describeRepository } from '../shared/git.mjs';
+import { captureDeclarations, hashedInputs, pythonProfile } from './profile.mjs';
 
 export const id = 'py';
 // Extraction logic revision; see extract/ts/index.mjs and docs/TECH-GUIDE.md.
-export const REVISION = 10;
+export const REVISION = 13;
 
 const SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)), 'extract.py');
 const PY_EXT = /\.py$/;
@@ -54,16 +55,33 @@ export function runPython(request, candidates = CANDIDATES, spawn = spawnSync) {
 }
 
 export function extract(root, config) {
+  const jedi = config.python?.jedi;
+  if (jedi !== undefined && typeof jedi !== 'boolean') fail('extract/python-jedi-config', 'python.jedi must be a boolean.', {
+    subject: { option: 'config.python.jedi' },
+  });
   const absRoot = path.resolve(root);
-  const { contents: snapshot, packageMarkers } = snapshotSources(absRoot, config, f => PY_EXT.test(f));
-  const files = [...snapshot.keys()];
+  const { declarations, ...profile } = pythonProfile(config.python);
+  const include = config.include || [];
+  const capture = jedi ? { ...config, include: [...include, ...include.filter(p => p.endsWith('.py')).map(p => `${p}i`)] } : config;
+  const { contents: snapshot, packageMarkers } = snapshotSources(absRoot, capture, f => PY_EXT.test(f) || (jedi && f.endsWith('.pyi')));
+  const sources = new Map([...snapshot].filter(([file]) => PY_EXT.test(file)));
+  const stubs = new Map([...snapshot].filter(([file]) => file.endsWith('.pyi')));
+  const dependencies = jedi ? captureDeclarations(absRoot, declarations) : new Map();
+  const files = [...sources.keys()];
   const fileSet = new Set(files);
   const directories = new Set();
   for (const file of files) {
     const parts = file.split('/');
     for (let i = 1; i < parts.length; i += 1) directories.add(parts.slice(0, i).join('/'));
   }
-  const { command, output } = runPython({ files, sources: Object.fromEntries([...snapshot].map(([rel, bytes]) => [rel, bytes.toString('base64')])) });
+  const encode = captured => Object.fromEntries([...captured].map(([rel, bytes]) => [rel, bytes.toString('base64')]));
+  const { command, output } = runPython({ files, jedi, profile, sources: encode(sources), stubs: encode(stubs), dependencies: encode(dependencies) });
+  if (output.unsupportedVersion) fail('extract/python-target-version', `The selected Python ${output.python} cannot parse target Python ${profile.targetVersion}.`, {
+    subject: { command }, supportedFixes: ['select a sufficiently recent interpreter with BAUIFY_PYTHON'],
+  });
+  if (output.jediMissing) fail('extract/python-jedi-unavailable', `The selected Python interpreter needs ${output.jediMissing} for Jedi call navigation.`, {
+    subject: { command }, supportedFixes: ['install extract/py/requirements-jedi.txt in the selected Python environment', 'set python.jedi to false'],
+  });
 
   const calls = [];
   const parsedFiles = new Map(output.files.filter(record => !record.error).map(record => [record.path, record]));
@@ -92,13 +110,18 @@ export function extract(root, config) {
     for (const fn of record.functions || []) functions.push({ file: record.path, ...fn });
     if (record.error) { parseErrors.push({ path: record.path, message: record.error }); continue; }
     for (const found of record.calls || []) {
-      const { _import: binding, ...call } = found;
+      const { _import: binding, _jedi: jediTarget, ...call } = found;
       if (binding) {
         const target = importedDefinition(record.path, binding);
         if (target && target.file !== record.path) {
           call.resolution = 'imported-function'; delete call.reason;
           call.target = target;
         }
+      }
+      if (!call.target && jediTarget) {
+        call.target = jediTarget;
+        call.resolution = 'python-jedi-declaration';
+        delete call.reason;
       }
       calls.push({ file: record.path, ...call });
     }
@@ -128,17 +151,24 @@ export function extract(root, config) {
   imports.sort((a, b) => compareText(a.from, b.from) || a.line - b.line || compareText(a.specifier, b.specifier));
 
   const repo = describeRepository(absRoot);
+  const adapter = `python@${output.python}` + (output.jedi ? `+jedi@${output.jedi.jedi}+parso@${output.jedi.parso}` : '');
+  const targetPlatform = profile.targetPlatform || output.jedi?.platform || undefined;
+  const languageScope = profile.targetVersion || targetPlatform || (jedi && (stubs.size || dependencies.size || profile.extraPaths.length))
+    ? { language: id, ...profile, targetPlatform, stubs: hashedInputs(stubs), declarations: hashedInputs(dependencies),
+        limitations: ['Type inputs aid source declaration lookup. Call targets remain in captured project Python source.'] }
+    : undefined;
   const facts = {
     schema_version: 1,
-    repository: { ...repo, language: 'py', adapter: `python@${output.python}`, adapterRevision: REVISION },
+    repository: { ...repo, language: 'py', adapter, adapterRevision: REVISION },
     files: fileRecords,
     packageMarkers,
     imports,
     symbols: symbols.sort((a, b) => compareText(a.file, b.file) || a.line - b.line || compareText(a.name, b.name)),
     functions: functions.sort((a, b) => compareText(a.file, b.file) || a.line - b.line || compareText(a.qualname, b.qualname)),
-    callModel: 'python-lexical-v2',
+    callModel: output.jedi ? 'python-lexical-v3' : 'python-lexical-v2',
     calls,
     unresolved,
+    ...(languageScope ? { languageScope } : {}),
   };
   if (parseErrors.length) facts.parse_errors = parseErrors.sort((a, b) => compareText(a.path, b.path));
   return facts;
