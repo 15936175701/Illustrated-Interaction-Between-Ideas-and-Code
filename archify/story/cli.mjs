@@ -1,5 +1,6 @@
 import path from 'node:path';
 import {scanStory,draftStory,buildStory} from './tool.mjs';
+import {exportStorySvg} from './svg.mjs';
 
 export function commandStory(args){
   const json=args.includes('--json'),positional=[];let repoRoot,action;
@@ -15,10 +16,10 @@ export function commandStory(args){
       positional.push(value);
     }
     [action]=positional;const input=positional[1];
-    const count={scan:2,draft:3,attach:4}[action];
-    if(!count||positional.length!==count)throw Error('Use story scan <native.html>, story draft <native.html> <brief.json>, or story attach <native.html> <brief.json> <enhanced.html>.');
+    const count={scan:2,draft:3,attach:4,svg:4}[action];
+    if(!count||positional.length!==count)throw Error('Use story scan <native.html>, story draft <native.html> <brief.json>, story attach <native.html> <brief.json> <enhanced.html>, or story svg <native.html> <brief.json> <story.svg>.');
     if(repoRoot&&action!=='attach')throw Error('--repo-root is supported for story attach code excerpts only.');
-    const result=action==='scan'?scanStory(path.resolve(input)):action==='draft'?draftStory(path.resolve(input),path.resolve(positional[2])):buildStory(path.resolve(input),path.resolve(positional[2]),path.resolve(positional[3]),{repoRoot});
+    const result=action==='svg'?exportStorySvg(path.resolve(input),path.resolve(positional[2]),path.resolve(positional[3])):action==='scan'?scanStory(path.resolve(input)):action==='draft'?draftStory(path.resolve(input),path.resolve(positional[2])):buildStory(path.resolve(input),path.resolve(positional[2]),path.resolve(positional[3]),{repoRoot});
     if(json||action==='scan')console.log(JSON.stringify({ok:true,command:'story',action,...result},null,2));
     else if(action==='draft')console.log('Brief: '+result.brief+'\nSource map: '+result.sourceMap);
     else console.log(result.output);
